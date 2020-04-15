@@ -1,0 +1,184 @@
+#!/usr/bin/env tclsh
+
+package require fileutil
+package require json
+package require json::write
+
+proc read_json {from} {
+  # Use 'open' so commands can be passed via "|..." syntax.
+  set fp [open $from r]
+  set contents [read $fp]
+  close $fp
+
+  return [::json::json2dict $contents]
+}
+
+proc write_json_pairs {to pairs} {
+  set contents [::json::write object {*}[dict map {k v} $pairs {::json::write string $v}]]
+  ::fileutil::writeFile $to.tmp $contents
+  file rename -force $to.tmp $to
+}
+
+set LOCKFILE brtlock.json
+
+set ROOT .brt
+set DOWNLOADS $ROOT/downloads
+set EXTRACTED $ROOT/extracted
+set TEMP $ROOT/temp
+
+file mkdir $ROOT
+file mkdir $DOWNLOADS
+file mkdir $EXTRACTED
+
+foreach suffix {jsonnet json} {
+  set brtfilename brtfile.$suffix
+  if {[file exists $brtfilename]} {
+    switch $suffix {
+      jsonnet {set input "|jsonnet $brtfilename"}
+      json {set input $brtfilename}
+    }
+
+    array set brtfile [read_json $input]
+  }
+}
+
+if {![info exists brtfile]} {
+  puts stderr "No brtfile found."
+  exit 1
+}
+
+if {[file exists $LOCKFILE]} {
+  array set lock [read_json $LOCKFILE]
+}
+
+foreach filedict $brtfile(files) {
+  array unset file
+  array set file $filedict
+  set needs_download 1
+  set integrity ""
+
+  if {[info exists lock($file(url))]} {
+    set integrity $lock($file(url))
+    set download $DOWNLOADS/$integrity
+
+    if {[file exists $download]} {
+      set needs_download 0
+    }
+  }
+
+  if {$needs_download} {
+    puts "Downloading $file(url)..."
+    exec -ignorestderr curl -Lo $TEMP $file(url) >@stdout 2>@stderr
+
+    puts "Checking integrity for $file(url)..."
+    set downloaded_integrity [lindex [exec sha256sum --bin $TEMP] 0]
+    if {$integrity != ""} {
+      if {$integrity != $downloaded_integrity} {
+        puts "Bad integrity for $file(url) (expected $integrity, got $downloaded_integrity)"
+        exit 1
+      }
+    } else {
+      set integrity $downloaded_integrity
+      set lock($file(url)) $downloaded_integrity
+
+      write_json_pairs $LOCKFILE [array get lock]
+    }
+
+    set download $DOWNLOADS/$integrity
+    file delete -force $download
+    file rename $TEMP $download
+  }
+
+  if {[info exists file(post)]} {
+    puts "Running post-download script..."
+    set env(BRT_DOWNLOAD) $download
+    exec -ignorestderr /bin/sh -ex -c $file(post)
+    unset env(BRT_DOWNLOAD)
+  }
+
+  set linktarget $download
+
+  if {[info exists file(arc)]} {
+    set doextract 1
+    array unset arc
+
+    if {[llength $file(arc)] == 1} {
+      if {!$file(arc)} {
+        set doextract 0
+      }
+    } else {
+      array set arc $file(arc)
+    }
+
+    set extracted $EXTRACTED/$integrity
+    set stamp $extracted/.brt-stamp
+
+    if {$doextract} {
+      if {![file exists $stamp]} {
+        file delete -force $extracted
+        file mkdir $extracted
+
+        if {[info exists arc(format)]} {
+          set format $arc(format)
+        } else {
+          if {[string match *.zip $file(url)]} {
+            set format zip
+          } else {
+            set format other
+          }
+        }
+
+        switch $format {
+          zip {
+            set command [list 7z -bsp1 -o$extracted x $download >@stdout]
+          }
+          default {
+            set command [list pv $download 2>@stdout | bsdtar -C $extracted -xf - >@stdout 2>@stderr]
+          }
+        }
+
+        puts "Extracting $file(url)..."
+        exec {*}$command
+
+        if {[info exists arc(post)]} {
+          puts "Running post-extract script..."
+          set env(BRT_EXTRACTED) $extracted
+          exec -ignorestderr /bin/sh -ex -c $arc(post)
+          unset env(BRT_EXTRACTED)
+        }
+
+        close [open $stamp w]
+        set dest $extracted
+      }
+
+      set linktarget $extracted
+      if {[info exists arc(prefix)]} {
+        set linktarget $linktarget/$arc(prefix)
+      }
+    }
+  }
+
+  set dest $file(dest)
+  if {[string match */ $dest]} {
+    set dest $dest/[file tail $file(url)]
+  }
+
+  set destdir [file dirname $dest]
+  file mkdir $destdir
+  file delete $dest
+  file link -symbolic $dest [fileutil::relative $destdir $linktarget]
+
+  set newlock($file(url)) $integrity
+  set integrities($integrity) 1
+}
+
+foreach {url integrity} [array get lock] {
+  if {![info exists integrities($integrity)]} {
+    puts "Deleting old download $url => $integrity..."
+    file delete $DOWNLOADS/$integrity
+    file delete -force $EXTRACTED/$integrity
+  }
+}
+
+# Trim the lockfile.
+write_json_pairs $LOCKFILE [array get newlock]
